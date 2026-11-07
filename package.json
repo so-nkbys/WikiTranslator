@@ -1,0 +1,14 @@
+{
+  "name": "wiki-translator",
+  "version": "1.0.0",
+  "private": true,
+  "author": "whale shark",
+  "description": "Sentence-level Japanese translations for English Wikipedia",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check wiki-translator.user.js"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  }
+}
