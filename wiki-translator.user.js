@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Edge Wikipedia 日本語訳併記
 // @namespace    local.wiki-translator
-// @version      1.0.0
+// @version      1.0.1
 // @author       whale shark
 // @description  Edge の「日本語に翻訳」後、英文の各センテンス直後に【日本語訳】を併記します。
 // @match        https://en.wikipedia.org/wiki/*
@@ -69,13 +69,18 @@
         return { text, targets };
     }
 
-    function insertTranslation(target, translation) {
-        const { node, offset, block } = target;
-        const span = node.ownerDocument.createElement('span');
+    function createTranslation(doc, translation) {
+        const span = doc.createElement('span');
         span.className = TRANSLATION_CLASS;
         span.lang = 'ja';
         span.setAttribute('translate', 'no');
         span.textContent = `【${translation}】`;
+        return span;
+    }
+
+    function insertTranslation(target, translation) {
+        const { node, offset, block } = target;
+        const span = createTranslation(node.ownerDocument, translation);
         if (offset < node.data.length) node.splitText(offset);
         let anchor = node;
         // Keep trailing citations with the English sentence, outside the translation's line breaks.
@@ -194,6 +199,7 @@
             #wiki-ja-controls [role="status"] { font-size: 12px; overflow-wrap: anywhere; }
             .wiki-edge-sentence { display: block; }
             .${TRANSLATION_CLASS} { display: block; color: #245b35; white-space: normal; }
+            .wiki-ja-heading-translation { font-size: 0.75em; font-weight: normal; }
             .wiki-ja-hidden .${TRANSLATION_CLASS} { display: none; }
             @media (prefers-color-scheme: dark) {
                 #wiki-ja-controls { background: #202122; color: #eaecf0; }
@@ -241,6 +247,7 @@
 
         let snapshots = [];
         let blockAttributes = [];
+        let headingSnapshots = [];
         function report(error) {
             console.error('[WikiTranslator]', error);
             status.textContent = `エラー：${error.message}`;
@@ -251,6 +258,66 @@
                 else block.setAttribute('translate', translate);
             }
             blockAttributes = [];
+        }
+        function saveHeadings() {
+            const headings = new Set([
+                ...doc.querySelectorAll('#firstHeading'),
+                ...content.querySelectorAll('h1, h2, h3, h4, h5, h6'),
+                ...doc.querySelectorAll('#vector-toc .vector-toc-text, .toc .toctext, #toc .toctext')
+            ]);
+            for (const heading of headings) {
+                if (Array.from(headings).some(other => other !== heading && other.contains(heading))) continue;
+                const source = collectTargets(heading).text.trim();
+                const canTranslate = !heading.matches('.vector-toc-text, .toctext') &&
+                    !heading.closest(EXCLUDED) && /[a-z]/i.test(source);
+                const original = doc.createDocumentFragment();
+                while (heading.firstChild) original.append(heading.firstChild);
+                headingSnapshots.push({
+                    heading, original, translate: heading.getAttribute('translate'), restored: false,
+                    source, canTranslate, translationElement: null
+                });
+                heading.append(original.cloneNode(true));
+                if (!canTranslate) heading.setAttribute('translate', 'no');
+            }
+        }
+        function restoreHeadings(resetAttributes = false) {
+            for (const snapshot of headingSnapshots) {
+                if (!snapshot.restored) {
+                    snapshot.heading.replaceChildren(snapshot.original);
+                    snapshot.restored = true;
+                }
+                if (resetAttributes) {
+                    if (snapshot.translationElement) snapshot.translationElement.remove();
+                    snapshot.heading.classList.remove('wiki-ja-hidden');
+                    if (snapshot.translate === null) snapshot.heading.removeAttribute('translate');
+                    else snapshot.heading.setAttribute('translate', snapshot.translate);
+                }
+            }
+            if (resetAttributes) headingSnapshots = [];
+        }
+        function captureHeadings() {
+            const results = headingSnapshots.map(snapshot => {
+                if (snapshot.restored) return null;
+                if (!snapshot.heading.isConnected) {
+                    throw new Error('記事の見出しが更新されました。再読み込みしてやり直してください。');
+                }
+                if (!snapshot.canTranslate) return null;
+                const translation = collectTargets(snapshot.heading).text.trim();
+                return translation !== snapshot.source && /[\u3040-\u30ff\u3400-\u9fff]/.test(translation)
+                    ? translation : null;
+            });
+            headingSnapshots.forEach((snapshot, index) => {
+                if (snapshot.restored || (snapshot.canTranslate && results[index] === null)) return;
+                snapshot.heading.replaceChildren(snapshot.original);
+                snapshot.restored = true;
+                snapshot.heading.setAttribute('translate', 'no');
+                if (results[index] !== null) {
+                    const span = createTranslation(doc, results[index]);
+                    span.classList.add('wiki-ja-heading-translation');
+                    snapshot.heading.append(span);
+                    snapshot.translationElement = span;
+                }
+            });
         }
         prepare.addEventListener('click', () => {
             if (snapshots.length) return;
@@ -265,12 +332,14 @@
                 if (!snapshots.length) {
                     throw new Error('翻訳対象の英文が見つかりません。英語の記事本文で実行してください。');
                 }
+                saveHeadings();
                 prepare.disabled = true;
                 importButton.disabled = false;
                 reset.disabled = false;
                 status.textContent = `${snapshots.reduce((sum, item) => sum + item.targets.length, 0)} 文を保存しました。②を実施してください。`;
             } catch (error) {
                 for (const snapshot of snapshots) restoreBlock(snapshot);
+                restoreHeadings(true);
                 snapshots = [];
                 report(error);
             }
@@ -279,6 +348,7 @@
             if (!snapshots.length) return;
             try {
                 const translations = snapshots.map(readTranslations);
+                captureHeadings();
                 const count = translations.flat().filter(value => value !== null).length;
                 snapshots.forEach((snapshot, blockIndex) => {
                     if (snapshot.completed) return;
@@ -301,10 +371,14 @@
                 const captured = snapshots.reduce((sum, snapshot) =>
                     sum + snapshot.translations.filter(translation => translation !== null).length, 0);
                 const pending = total - captured;
-                importButton.disabled = pending === 0;
-                toggle.disabled = captured === 0;
+                const translatableHeadings = headingSnapshots.filter(snapshot => snapshot.canTranslate);
+                const capturedHeadings = translatableHeadings.filter(snapshot => snapshot.translationElement).length;
+                const pendingHeadings = translatableHeadings.length - capturedHeadings;
+                importButton.disabled = pending === 0 && pendingHeadings === 0;
+                toggle.disabled = captured === 0 && capturedHeadings === 0;
                 status.textContent = `今回 ${count} 文追加・累計 ${captured}/${total} 文・未取得 ${pending} 文。` +
-                    (pending
+                    (translatableHeadings.length ? `見出し ${capturedHeadings}/${translatableHeadings.length} 件。` : '') +
+                    (pending || pendingHeadings
                         ? (count === 0 ? '新しい日本語訳はありません。' : '')
                         : '英文差し入れ完了。');
             } catch (error) {
@@ -319,6 +393,7 @@
             snapshots = [];
             for (const span of content.querySelectorAll(`.${TRANSLATION_CLASS}`)) span.remove();
             restoreAttributes();
+            restoreHeadings(true);
             content.classList.remove('wiki-ja-hidden');
             prepare.disabled = true;
             importButton.disabled = true;
@@ -326,10 +401,13 @@
             toggle.disabled = true;
             toggle.textContent = '訳文を隠す';
             toggle.setAttribute('aria-pressed', 'false');
-            status.textContent = '保存した本文を原文に戻しました。Edge の翻訳状態をリセットするため、再読み込みしてからやり直してください。';
+            status.textContent = '本文・記事タイトル・見出しを原文に戻しました。再読み込みしてからやり直してください。';
         });
         toggle.addEventListener('click', () => {
             const hidden = content.classList.toggle('wiki-ja-hidden');
+            for (const snapshot of headingSnapshots) {
+                snapshot.heading.classList.toggle('wiki-ja-hidden', hidden);
+            }
             toggle.textContent = hidden ? '訳文を表示' : '訳文を隠す';
             toggle.setAttribute('aria-pressed', String(hidden));
         });

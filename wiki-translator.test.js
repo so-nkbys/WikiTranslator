@@ -310,6 +310,131 @@ test('preparation can be cancelled without changing original markup', () => {
     assert.equal(doc.querySelector('p').innerHTML, original);
 });
 
+test('restores article title, section headings and TOC labels without changing the browser tab title', () => {
+    const doc = page('<div class="mw-heading"><h2 id="Concept"><i>Concept and development</i></h2>' +
+        '<span class="mw-editsection"><a href="#edit">edit</a></span></div>' +
+        '<h3 id="Design">Design</h3><p>Hello. Next sentence.</p>');
+    doc.title = 'Zaku - Wikipedia';
+    doc.body.insertAdjacentHTML('afterbegin', '<h1 id="firstHeading"><span>Zaku</span></h1>' +
+        '<nav id="vector-toc"><a href="#Concept"><span class="vector-toc-text"><span>1</span> Concept and development</span></a></nav>' +
+        '<div id="toc"><a href="#Design"><span class="toctext">Design</span></a></div>');
+    const titleNode = doc.querySelector('#firstHeading span');
+    const conceptNode = doc.querySelector('#Concept i');
+    const editLink = doc.querySelector('.mw-editsection a');
+    let clicks = 0;
+    conceptNode.addEventListener('click', () => clicks++);
+    const headingSelectors = ['#firstHeading', '#Concept', '#Design', '.vector-toc-text', '.toctext'];
+    const originals = headingSelectors.map(selector => doc.querySelector(selector).innerHTML);
+    install(doc, edge);
+    const [prepare, importButton, reset] = buttons(doc);
+    prepare.click();
+    for (const selector of headingSelectors) {
+        assert.equal(doc.querySelector(selector).getAttribute('translate'),
+            selector.startsWith('.') ? 'no' : null);
+        doc.querySelector(selector).textContent = '翻訳された見出し';
+    }
+    doc.title = 'ザク - ウィキペディア';
+    doc.querySelector('.wiki-edge-sentence').textContent = 'こんにちは。';
+    importButton.click();
+    headingSelectors.forEach((selector, index) => {
+        const heading = doc.querySelector(selector);
+        const translation = heading.querySelector('.wiki-ja-heading-translation');
+        if (selector.startsWith('.')) {
+            assert.equal(heading.innerHTML, originals[index]);
+            assert.equal(translation, null);
+        } else {
+            assert.equal(translation.textContent, '【翻訳された見出し】');
+            const copy = heading.cloneNode(true);
+            copy.querySelector('.wiki-ja-heading-translation').remove();
+            assert.equal(copy.innerHTML, originals[index]);
+        }
+    });
+    assert.equal(doc.querySelector('#firstHeading span'), titleNode);
+    assert.equal(doc.querySelector('#Concept i'), conceptNode);
+    assert.equal(doc.querySelector('.mw-editsection a'), editLink);
+    conceptNode.click();
+    assert.equal(clicks, 1);
+    assert.equal(doc.querySelector('#vector-toc a').getAttribute('href'), '#Concept');
+    assert.equal(doc.title, 'ザク - ウィキペディア');
+    importButton.click();
+    assert.equal(doc.querySelector('#Concept i'), conceptNode);
+    reset.click();
+    headingSelectors.forEach((selector, index) => {
+        assert.equal(doc.querySelector(selector).innerHTML, originals[index]);
+        assert.equal(doc.querySelector(selector).hasAttribute('translate'), false);
+    });
+    assert.equal(doc.title, 'ザク - ウィキペディア');
+});
+
+test('keeps untranslated headings pending after body completion and hides heading translations outside content', () => {
+    const doc = page('<h2 id="heading">History</h2><p>Hello.</p>');
+    doc.body.insertAdjacentHTML('afterbegin', '<h1 id="firstHeading">Zaku</h1>');
+    doc.title = 'Zaku - Wikipedia';
+    install(doc, edge);
+    const [prepare, importButton, reset, toggle] = buttons(doc);
+    prepare.click();
+    doc.querySelector('.wiki-edge-sentence').textContent = 'こんにちは。';
+    importButton.click();
+    assert.equal(importButton.disabled, false);
+    assert.match(doc.querySelector('[role="status"]').textContent, /見出し 0\/2 件/);
+    assert.equal(doc.querySelector('#heading').getAttribute('translate'), null);
+    doc.querySelector('#heading').textContent = '歴史';
+    importButton.click();
+    assert.equal(doc.querySelector('#heading').textContent, 'History【歴史】');
+    assert.equal(importButton.disabled, false);
+    toggle.click();
+    doc.querySelector('#firstHeading').textContent = 'ザク';
+    importButton.click();
+    const titleTranslation = doc.querySelector('#firstHeading .wiki-ja-heading-translation');
+    assert.equal(titleTranslation.textContent, '【ザク】');
+    assert.equal(doc.defaultView.getComputedStyle(titleTranslation).display, 'none');
+    assert.equal(importButton.disabled, true);
+    assert.match(doc.querySelector('[role="status"]').textContent, /見出し 2\/2 件/);
+    toggle.click();
+    assert.equal(doc.defaultView.getComputedStyle(titleTranslation).display, 'block');
+    reset.click();
+    assert.equal(doc.querySelector('#firstHeading').textContent, 'Zaku');
+    assert.equal(doc.querySelector('#heading').textContent, 'History');
+    assert.equal(doc.querySelector('#firstHeading .wiki-ja-heading-translation'), null);
+    assert.equal(doc.querySelector('#firstHeading').hasAttribute('translate'), false);
+    assert.equal(doc.title, 'Zaku - Wikipedia');
+});
+
+test('excludes edit controls from heading translations and does not duplicate captured headings', () => {
+    const doc = page('<h2 id="heading"><span>History</span>' +
+        '<span class="mw-editsection"><a href="#edit">edit</a></span></h2><p>Hello.</p>');
+    const heading = doc.querySelector('h2');
+    const editLink = heading.querySelector('a');
+    install(doc, edge);
+    const [prepare, importButton, reset] = buttons(doc);
+    prepare.click();
+    heading.querySelector('span').textContent = '歴史';
+    heading.querySelector('a').textContent = '編集';
+    importButton.click();
+    importButton.click();
+    assert.equal(heading.querySelector('.wiki-ja-heading-translation').textContent, '【歴史】');
+    assert.equal(heading.querySelectorAll('.wiki-ja-heading-translation').length, 1);
+    assert.equal(heading.querySelector('a'), editLink);
+    assert.equal(editLink.textContent, 'edit');
+    reset.click();
+    assert.equal(heading.querySelector('a'), editLink);
+    assert.equal(heading.textContent, 'Historyedit');
+});
+
+test('restores headings when cancelling before capture and preserves original translate attributes', () => {
+    const doc = page('<h2 id="heading" translate="yes"><b>History</b></h2><p>Hello.</p>');
+    const heading = doc.querySelector('h2');
+    const original = heading.firstChild;
+    install(doc, edge);
+    const [prepare, , reset] = buttons(doc);
+    prepare.click();
+    heading.textContent = '歴史';
+    reset.click();
+    assert.equal(heading.firstChild, original);
+    assert.equal(heading.textContent, 'History');
+    assert.equal(heading.getAttribute('translate'), 'yes');
+});
+
 test('does not duplicate nested blocks or translate excluded areas', () => {
     const doc = page('<ul><li><p>Hello.</p><ul><li>Next.</li></ul></li></ul>' +
         '<div class="reflist"><p>Reference.</p></div><table class="infobox"><tr><td><p>Info.</p></td></tr></table>' +
